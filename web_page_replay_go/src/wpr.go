@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/catapult-project/catapult/web_page_replay_go/src/webpagereplay"
+	"github.com/elazarl/goproxy"
 	"github.com/urfave/cli"
 	"golang.org/x/net/http2"
 )
@@ -59,7 +60,7 @@ type CommonConfig struct {
 
 	// Flags common to RecordCommand and ReplayCommand.
 	host                                     string
-	httpPort, httpsPort, httpSecureProxyPort int
+	httpPort, httpsPort, httpSecureProxyPort, httpConnectProxyPort int
 	certConfig                               CertConfig
 	injectScripts                            string
 
@@ -112,6 +113,12 @@ func (common *CommonConfig) Flags() []cli.Flag {
 			Value:       "localhost",
 			Usage:       "IP address to bind all servers to. Defaults to localhost if not specified.",
 			Destination: &common.host,
+		},
+		cli.IntFlag{
+			Name:        "http_connect_proxy_port",
+			Value:       -1,
+			Usage:       "Port number to listen on for HTTP CONNECT proxy requests, 0 to use any port, or -1 to disable.",
+			Destination: &common.httpConnectProxyPort,
 		},
 		cli.IntFlag{
 			Name:        "http_port",
@@ -288,6 +295,40 @@ func startServers(tlsconfig *tls.Config, httpHandler, httpsHandler http.Handler,
 				Addr:      fmt.Sprintf("%v:%v", common.host, common.httpSecureProxyPort),
 				Handler:   httpHandler, // this server proxies HTTP requests over an HTTPS connection
 				TLSConfig: nil,         // use the default since this is as a proxy, not a MITM server
+			},
+		})
+	}
+	if common.httpConnectProxyPort > -1 {
+		proxyHandler := goproxy.NewProxyHttpServer()
+
+		// goproxyCa.Leaf := common.root_cert.ParseCertificate()
+		goproxy.GoproxyCa = common.root_cert
+		goproxy.OkConnect = &goproxy.ConnectAction{Action: goproxy.ConnectAccept, TLSConfig: goproxy.TLSConfigFromCA(&common.root_cert)}
+		goproxy.MitmConnect = &goproxy.ConnectAction{Action: goproxy.ConnectMitm, TLSConfig: goproxy.TLSConfigFromCA(&common.root_cert)}
+		goproxy.HTTPMitmConnect = &goproxy.ConnectAction{Action: goproxy.ConnectHTTPMitm, TLSConfig: goproxy.TLSConfigFromCA(&common.root_cert)}
+		goproxy.RejectConnect = &goproxy.ConnectAction{Action: goproxy.ConnectReject, TLSConfig: goproxy.TLSConfigFromCA(&common.root_cert)}
+
+		// proxyHandler.Verbose = false
+
+		proxyHandler.Tr.Dial = func(network, addr string) (c net.Conn, err error) {
+			rewritten := addr
+			if common.httpPort > -1 && strings.HasSuffix(rewritten, ":80") {
+				rewritten = fmt.Sprintf("%s:%d", common.host, common.httpPort)
+			} else if common.httpsPort > -1 && strings.HasSuffix(rewritten, ":443") {
+				rewritten = fmt.Sprintf("%s:%d", common.host, common.httpsPort)
+			}
+			// fmt.Println("mydial %s %s->%s", network, addr, rewritten)
+
+			return net.Dial(network, rewritten)
+		}
+
+		servers = append(servers, &Server{
+			Scheme: "http",
+			Host:   common.host,
+			Port:   common.httpConnectProxyPort,
+			Server: &http.Server{
+				Addr:    fmt.Sprintf("%v:%v", common.host, common.httpConnectProxyPort),
+				Handler: proxyHandler,
 			},
 		})
 	}
